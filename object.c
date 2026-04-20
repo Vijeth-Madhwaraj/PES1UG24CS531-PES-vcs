@@ -211,8 +211,98 @@ int object_write(ObjectType type, const void *data, size_t len, ObjectID *id_out
 //
 // The caller is responsible for calling free(*data_out).
 // Returns 0 on success, -1 on error (file not found, corrupt, etc.).
-int object_read(const ObjectID *id, ObjectType *type_out, void **data_out, size_t *len_out) {
-    // TODO: Implement
-    (void)id; (void)type_out; (void)data_out; (void)len_out;
-    return -1;
-}
+	int object_read(const ObjectID *id, ObjectType *type_out, void **data_out, size_t *len_out) {
+	    char path[512];
+	    object_path(id, path, sizeof(path));
+	
+	    // 1. Open file
+	    FILE *f = fopen(path, "rb");
+	    if (!f) return -1;
+	
+	    // 2. Get file size
+	    if (fseek(f, 0, SEEK_END) != 0) {
+	        fclose(f);
+	        return -1;
+	    }
+	    long fsize = ftell(f);
+	    if (fsize < 0) {
+	        fclose(f);
+	        return -1;
+	    }
+	    rewind(f);
+	
+	    // 3. Read entire file
+	    char *buf = malloc(fsize);
+	    if (!buf) {
+	        fclose(f);
+	        return -1;
+	    }
+	
+	    if (fread(buf, 1, fsize, f) != (size_t)fsize) {
+	        fclose(f);
+	        free(buf);
+	        return -1;
+	    }
+	    fclose(f);
+	
+	    // 4. Verify hash (integrity check)
+	    ObjectID computed;
+	    compute_hash(buf, fsize, &computed);
+	    if (memcmp(computed.hash, id->hash, HASH_SIZE) != 0) {
+	        free(buf);
+	        return -1;
+	    }
+	
+	    // 5. Find header/data separator ('\0')
+	    char *null_pos = memchr(buf, '\0', fsize);
+	    if (!null_pos) {
+	        free(buf);
+	        return -1;
+	    }
+	
+	    size_t header_len = null_pos - buf;
+	    char *data_start = null_pos + 1;
+	    size_t data_len = fsize - (header_len + 1);
+	
+	    // 6. Parse header: "<type> <size>"
+	    char type_str[16];
+	    size_t declared_size;
+	
+	    if (sscanf(buf, "%15s %zu", type_str, &declared_size) != 2) {
+	        free(buf);
+	        return -1;
+	    }
+	
+	    // 7. Validate size
+	    if (declared_size != data_len) {
+	        free(buf);
+	        return -1;
+	    }
+	
+	    // 8. Convert type string to enum
+	    if (strcmp(type_str, "blob") == 0) {
+	        *type_out = OBJ_BLOB;
+	    } else if (strcmp(type_str, "tree") == 0) {
+	        *type_out = OBJ_TREE;
+	    } else if (strcmp(type_str, "commit") == 0) {
+	        *type_out = OBJ_COMMIT;
+	    } else {
+	        free(buf);
+	        return -1;
+	    }
+	
+	    // 9. Allocate and copy data
+	    void *out = malloc(data_len);
+	    if (!out) {
+	        free(buf);
+	        return -1;
+	    }
+	
+	    memcpy(out, data_start, data_len);
+	
+	    *data_out = out;
+	    *len_out = data_len;
+	
+	    free(buf);
+	    return 0;
+	}
