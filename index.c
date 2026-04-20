@@ -23,7 +23,14 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <dirent.h>
+#include <time.h>
 
+// Implemented in object.c
+int object_write(ObjectType type, const void *data, size_t len, ObjectID *id_out);
+
+static int compare_index(const void *a, const void *b) {
+    return strcmp(((IndexEntry*)a)->path, ((IndexEntry*)b)->path);
+}
 // ─── PROVIDED ────────────────────────────────────────────────────────────────
 
 // Find an index entry by path (linear scan).
@@ -135,59 +142,47 @@ int index_status(const Index *index) {
 //
 // Returns 0 on success, -1 on error.
 int index_load(Index *index) {
+    // TODO: Implement index loading
+    // (See Lab Appendix for logical steps)
+    if (!index) return -1;
     index->count = 0;
 
     FILE *f = fopen(".pes/index", "r");
-    if (!f) {
-        // No index file yet → empty index (NOT an error)
-        return 0;
-    }
+    if (!f) return 0;  // File doesn't exist yet — empty index is OK
 
-    char hash_hex[HASH_HEX_SIZE + 1];
-    IndexEntry entry;
+    while (index->count < MAX_INDEX_ENTRIES) {
+        IndexEntry *e = &index->entries[index->count];
+        char hash_hex[65];
 
-    while (1) {
-        // Read fixed fields first
-        int ret = fscanf(f, "%o %64s %lu %u ", 
-                         &entry.mode,
+        int ret = fscanf(f, "%o %64s %lu %u %511s\n",
+                         &e->mode,
                          hash_hex,
-                         &entry.mtime_sec,
-                         &entry.size);
+                         &e->mtime_sec,
+                         &e->size,
+                         e->path);
 
-        if (ret == EOF) break;
-        if (ret != 4) {
+        if (ret != 5) break;
+
+        // Parse hex hash safely
+        int parse_ok = 1;
+        for (int i = 0; i < 32; i++) {
+            unsigned int byte;
+            if (sscanf(hash_hex + i * 2, "%2x", &byte) != 1) {
+                parse_ok = 0;
+                break;
+            }
+            e->hash.hash[i] = (uint8_t)byte;
+        }
+        
+        if (!parse_ok) {
             fclose(f);
-            return -1;
+            return -1;  // Corrupted hash format
         }
 
-        // Read the rest of the line as path (including spaces)
-        if (!fgets(entry.path, sizeof(entry.path), f)) {
-            fclose(f);
-            return -1;
-        }
-
-        // Remove trailing newline
-        size_t len = strlen(entry.path);
-        if (len > 0 && entry.path[len - 1] == '\n') {
-            entry.path[len - 1] = '\0';
-        }
-
-        // Convert hash hex → binary
-        if (hex_to_hash(hash_hex, &entry.hash) < 0) {
-            fclose(f);
-            return -1;
-        }
-
-        // Store entry
-        if (index->count >= MAX_INDEX_ENTRIES) {
-            fclose(f);
-            return -1;
-        }
-
-        index->entries[index->count++] = entry;
+        index->count++;
     }
 
-    fclose(f);
+    if (fclose(f) != 0) return -1;
     return 0;
 }
 
@@ -201,69 +196,72 @@ int index_load(Index *index) {
 //   - rename                           : atomically moving the temp file over the old index
 //
 // Returns 0 on success, -1 on error.
-int compare_index_entries(const void *a, const void *b) {
-    const IndexEntry *ea = a;
-    const IndexEntry *eb = b;
-    return strcmp(ea->path, eb->path);
-}
 
 int index_save(const Index *index) {
-    // 1. Make a sorted copy (do NOT modify original)
-    Index sorted = *index;
-    qsort(sorted.entries, sorted.count, sizeof(IndexEntry), compare_index_entries);
+    // TODO: Implement atomic index saving
+    // (See Lab Appendix for logical steps)
+    if (!index) return -1;
 
-    // 2. Create temp file path
-    char temp_path[] = ".pes/index.tmpXXXXXX";
-    int fd = mkstemp(temp_path);
-    if (fd < 0) return -1;
+    // Ensure .pes directory exists
+    mkdir(".pes", 0755);
 
-    FILE *f = fdopen(fd, "w");
+    // Create sorted copy of entries (only what we write, not the whole 5MB struct!)
+    IndexEntry *sorted_entries = malloc(index->count * sizeof(IndexEntry));
+    if (!sorted_entries && index->count > 0) return -1;
+
+    if (index->count > 0) {
+        memcpy(sorted_entries, index->entries, index->count * sizeof(IndexEntry));
+        qsort(sorted_entries, index->count, sizeof(IndexEntry), compare_index);
+    }
+
+    FILE *f = fopen(".pes/index.tmp", "w");
     if (!f) {
-        close(fd);
-        unlink(temp_path);
+        free(sorted_entries);
         return -1;
     }
 
-    // 3. Write entries
-    for (int i = 0; i < sorted.count; i++) {
-        char hex[HASH_HEX_SIZE + 1];
-        hash_to_hex(&sorted.entries[i].hash, hex);
+    for (int i = 0; i < index->count; i++) {
+        IndexEntry *e = &sorted_entries[i];
 
-        if (fprintf(f, "%o %s %lu %u %s\n",
-                    sorted.entries[i].mode,
-                    hex,
-                    sorted.entries[i].mtime_sec,
-                    sorted.entries[i].size,
-                    sorted.entries[i].path) < 0) {
-            fclose(f);
-            unlink(temp_path);
-            return -1;
+        char hash_hex[65];
+        for (int j = 0; j < 32; j++) {
+            snprintf(hash_hex + j * 2, 3, "%02x", e->hash.hash[j]);
         }
+        hash_hex[64] = '\0';
+
+        fprintf(f, "%o %s %lu %u %s\n",
+                e->mode,
+                hash_hex,
+                e->mtime_sec,
+                e->size,
+                e->path);
     }
 
-    // 4. Flush + fsync file
-    fflush(f);
-    if (fsync(fileno(f)) < 0) {
+    if (fflush(f) != 0) {
         fclose(f);
-        unlink(temp_path);
+        unlink(".pes/index.tmp");
+        free(sorted_entries);
+        return -1;
+    }
+    if (fsync(fileno(f)) != 0) {
+        fclose(f);
+        unlink(".pes/index.tmp");
+        free(sorted_entries);
+        return -1;
+    }
+    if (fclose(f) != 0) {
+        unlink(".pes/index.tmp");
+        free(sorted_entries);
         return -1;
     }
 
-    fclose(f);
-
-    // 5. Atomic rename
-    if (rename(temp_path, ".pes/index") < 0) {
-        unlink(temp_path);
+    if (rename(".pes/index.tmp", ".pes/index") != 0) {
+        unlink(".pes/index.tmp");
+        free(sorted_entries);
         return -1;
     }
 
-    // 6. fsync directory (optional but correct)
-    int dir_fd = open(".pes", O_DIRECTORY | O_RDONLY);
-    if (dir_fd >= 0) {
-        fsync(dir_fd);
-        close(dir_fd);
-    }
-
+    free(sorted_entries);
     return 0;
 }
 
@@ -279,6 +277,69 @@ int index_save(const Index *index) {
 int index_add(Index *index, const char *path) {
     // TODO: Implement file staging
     // (See Lab Appendix for logical steps)
-    (void)index; (void)path;
-    return -1;
+    if (!index || !path) return -1;
+
+    struct stat st;
+    if (stat(path, &st) != 0) {
+        return -1;  // File doesn't exist
+    }
+
+    FILE *f = fopen(path, "rb");
+    if (!f) return -1;
+
+    size_t size = st.st_size;
+
+    void *data = malloc(size ? size : 1);
+    if (!data) {
+        fclose(f);
+        return -1;
+    }
+
+    if (size > 0) {
+        size_t read_bytes = fread(data, 1, size, f);
+        if (read_bytes != size) {
+            fclose(f);
+            free(data);
+            return -1;  // Short read or error
+        }
+    }
+    
+    if (fclose(f) != 0) {
+        free(data);
+        return -1;
+    }
+
+    ObjectID id;
+    if (object_write(OBJ_BLOB, data, size, &id) != 0) {
+        free(data);
+        return -1;
+    }
+
+    free(data);
+
+    IndexEntry *e = index_find(index, path);
+
+    if (!e) {
+        if (index->count >= MAX_INDEX_ENTRIES) return -1;
+        e = &index->entries[index->count];
+        index->count++;
+    }
+
+    // SAFE copy
+    strncpy(e->path, path, sizeof(e->path) - 1);
+    e->path[sizeof(e->path) - 1] = '\0';
+
+    // Compute Git-style mode: 100644 (regular) or 100755 (executable)
+    if (st.st_mode & S_IXUSR) {
+        e->mode = 0100755;  // executable
+    } else {
+        e->mode = 0100644;  // regular file
+    }
+    
+    e->mtime_sec = st.st_mtime;
+    e->size = st.st_size;
+
+    memcpy(e->hash.hash, id.hash, HASH_SIZE);
+
+    return index_save(index);
 }
