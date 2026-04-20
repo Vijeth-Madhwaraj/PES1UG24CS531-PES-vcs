@@ -94,9 +94,99 @@ int object_exists(const ObjectID *id) {
 //
 // Returns 0 on success, -1 on error.
 int object_write(ObjectType type, const void *data, size_t len, ObjectID *id_out) {
-    // TODO: Implement
-    (void)type; (void)data; (void)len; (void)id_out;
-    return -1;
+    char header[64];
+    const char *type_str;
+
+    // 1. Convert type enum to string
+    switch (type) {
+        case OBJ_BLOB:   type_str = "blob"; break;
+        case OBJ_TREE:   type_str = "tree"; break;
+        case OBJ_COMMIT: type_str = "commit"; break;
+        default: return -1;
+    }
+
+    // 2. Build header: "<type> <size>\0"
+    int header_len = snprintf(header, sizeof(header), "%s %zu", type_str, len) + 1;
+
+    // 3. Allocate full buffer (header + data)
+    size_t total_len = header_len + len;
+    char *full = malloc(total_len);
+    if (!full) return -1;
+
+    memcpy(full, header, header_len);
+    memcpy(full + header_len, data, len);
+
+    // 4. Compute hash
+    compute_hash(full, total_len, id_out);
+
+    // 5. Deduplication check
+    if (object_exists(id_out)) {
+        free(full);
+        return 0;
+    }
+
+    // 6. Build paths
+    char final_path[512];
+    object_path(id_out, final_path, sizeof(final_path));
+
+    // Extract shard directory path
+    char dir_path[512];
+    snprintf(dir_path, sizeof(dir_path), "%s", final_path);
+    char *slash = strrchr(dir_path, '/');
+    if (!slash) {
+        free(full);
+        return -1;
+    }
+    *slash = '\0';
+
+    // 7. Create shard directory if needed
+    mkdir(dir_path, 0755);  // OK if it already exists
+
+    // 8. Create temp file path
+    char temp_path[512];
+    snprintf(temp_path, sizeof(temp_path), "%s/tmpXXXXXX", dir_path);
+
+    int fd = mkstemp(temp_path);
+    if (fd < 0) {
+        free(full);
+        return -1;
+    }
+
+    // 9. Write full object
+    ssize_t written = write(fd, full, total_len);
+    if (written != (ssize_t)total_len) {
+        close(fd);
+        unlink(temp_path);
+        free(full);
+        return -1;
+    }
+
+    // 10. fsync file
+    if (fsync(fd) < 0) {
+        close(fd);
+        unlink(temp_path);
+        free(full);
+        return -1;
+    }
+
+    close(fd);
+
+    // 11. Atomic rename
+    if (rename(temp_path, final_path) < 0) {
+        unlink(temp_path);
+        free(full);
+        return -1;
+    }
+
+    // 12. fsync directory
+    int dir_fd = open(dir_path, O_DIRECTORY | O_RDONLY);
+    if (dir_fd >= 0) {
+        fsync(dir_fd);
+        close(dir_fd);
+    }
+
+    free(full);
+    return 0;
 }
 
 // Read an object from the store.
