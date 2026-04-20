@@ -201,11 +201,70 @@ int index_load(Index *index) {
 //   - rename                           : atomically moving the temp file over the old index
 //
 // Returns 0 on success, -1 on error.
+int compare_index_entries(const void *a, const void *b) {
+    const IndexEntry *ea = a;
+    const IndexEntry *eb = b;
+    return strcmp(ea->path, eb->path);
+}
+
 int index_save(const Index *index) {
-    // TODO: Implement atomic index saving
-    // (See Lab Appendix for logical steps)
-    (void)index;
-    return -1;
+    // 1. Make a sorted copy (do NOT modify original)
+    Index sorted = *index;
+    qsort(sorted.entries, sorted.count, sizeof(IndexEntry), compare_index_entries);
+
+    // 2. Create temp file path
+    char temp_path[] = ".pes/index.tmpXXXXXX";
+    int fd = mkstemp(temp_path);
+    if (fd < 0) return -1;
+
+    FILE *f = fdopen(fd, "w");
+    if (!f) {
+        close(fd);
+        unlink(temp_path);
+        return -1;
+    }
+
+    // 3. Write entries
+    for (int i = 0; i < sorted.count; i++) {
+        char hex[HASH_HEX_SIZE + 1];
+        hash_to_hex(&sorted.entries[i].hash, hex);
+
+        if (fprintf(f, "%o %s %lu %u %s\n",
+                    sorted.entries[i].mode,
+                    hex,
+                    sorted.entries[i].mtime_sec,
+                    sorted.entries[i].size,
+                    sorted.entries[i].path) < 0) {
+            fclose(f);
+            unlink(temp_path);
+            return -1;
+        }
+    }
+
+    // 4. Flush + fsync file
+    fflush(f);
+    if (fsync(fileno(f)) < 0) {
+        fclose(f);
+        unlink(temp_path);
+        return -1;
+    }
+
+    fclose(f);
+
+    // 5. Atomic rename
+    if (rename(temp_path, ".pes/index") < 0) {
+        unlink(temp_path);
+        return -1;
+    }
+
+    // 6. fsync directory (optional but correct)
+    int dir_fd = open(".pes", O_DIRECTORY | O_RDONLY);
+    if (dir_fd >= 0) {
+        fsync(dir_fd);
+        close(dir_fd);
+    }
+
+    return 0;
 }
 
 // Stage a file for the next commit.
